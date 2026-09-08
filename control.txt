@@ -1,0 +1,9 @@
+Package: com.axiom.swipepatcher
+Name: SwipePatcher
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: One-shot upswipe byte patcher body to head
+Maintainer: axiom
+Author: axiom
+Section: Tweaks
+Depends: mobilesubstrate | libhooker | substitute
