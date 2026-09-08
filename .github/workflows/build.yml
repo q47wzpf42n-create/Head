@@ -1,0 +1,118 @@
+name: SwipePatcher Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  THEOS:                ${{ github.workspace }}/theos
+  THEOS_PACKAGE_SCHEME: rootless
+  THEOS_DEVICE_IP:      ''
+  THEOS_DEVICE_PORT:    ''
+
+jobs:
+  build:
+    runs-on: macos-14   # pinned — avoids runner drift
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. System deps ─────────────────────────────────────────────────────
+      - name: Install brew dependencies
+        run: |
+          brew update --quiet
+          brew install ldid dpkg --quiet
+
+      # ── 3. Theos ───────────────────────────────────────────────────────────
+      - name: Clone Theos
+        run: |
+          git clone --recursive \
+            https://github.com/theos/theos.git \
+            "$THEOS"
+          echo "Theos cloned → $THEOS"
+
+      # ── 4. iOS SDK (dynamic latest-release fetch with hardcoded fallback) ──
+      - name: Install iOS SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+
+          # Try GitHub API first (gets newest SDK automatically)
+          ASSET_URL=$(curl -sfL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/theos/sdks/releases/latest \
+            | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              urls = [a['browser_download_url']
+                      for a in data.get('assets', [])
+                      if a['name'].endswith('.sdk.tar.xz')]
+              print(urls[0] if urls else '')
+          except Exception:
+              print('')
+          ")
+
+          # Hardcoded fallbacks if API fails or rate-limited
+          FALLBACKS=(
+            "https://github.com/theos/sdks/releases/download/iPhoneOS17.2/iPhoneOS17.2.sdk.tar.xz"
+            "https://github.com/theos/sdks/releases/download/iPhoneOS16.5/iPhoneOS16.5.sdk.tar.xz"
+            "https://github.com/theos/sdks/releases/download/iPhoneOS15.5/iPhoneOS15.5.sdk.tar.xz"
+          )
+
+          download_and_extract() {
+            local url="$1"
+            echo "Trying: $url"
+            curl -fL --retry 3 --retry-delay 5 \
+              --connect-timeout 30 \
+              "$url" -o /tmp/sdk.tar.xz && \
+            tar xJf /tmp/sdk.tar.xz -C "$THEOS/sdks/" && \
+            rm /tmp/sdk.tar.xz && \
+            echo "SDK OK from $url" && return 0
+            return 1
+          }
+
+          SUCCESS=0
+          if [ -n "$ASSET_URL" ]; then
+            download_and_extract "$ASSET_URL" && SUCCESS=1
+          fi
+
+          if [ "$SUCCESS" -eq 0 ]; then
+            for FB in "${FALLBACKS[@]}"; do
+              download_and_extract "$FB" && SUCCESS=1 && break
+            done
+          fi
+
+          if [ "$SUCCESS" -eq 0 ]; then
+            echo "FATAL: could not download any iOS SDK" >&2
+            exit 1
+          fi
+
+          echo "Available SDKs:"
+          ls "$THEOS/sdks/"
+
+      # ── 5. Build ───────────────────────────────────────────────────────────
+      - name: Build .deb package
+        run: |
+          make package \
+            FINALPACKAGE=1 \
+            STRIP=1 \
+            THEOS="$THEOS" \
+            THEOS_PACKAGE_SCHEME=rootless
+
+      # ── 6. Verify output exists ────────────────────────────────────────────
+      - name: Verify package
+        run: |
+          ls -lh packages/*.deb
+          echo "Build OK"
+
+      # ── 7. Upload artifact ─────────────────────────────────────────────────
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwipePatcher-deb
+          path: packages/*.deb
+          retention-days: 14
+          if-no-files-found: error
