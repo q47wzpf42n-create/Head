@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14   # pinned — avoids runner drift
+    runs-on: macos-14
 
     steps:
       # ── 1. Source ──────────────────────────────────────────────────────────
@@ -32,65 +32,74 @@ jobs:
           git clone --recursive \
             https://github.com/theos/theos.git \
             "$THEOS"
-          echo "Theos cloned → $THEOS"
 
-      # ── 4. iOS SDK (dynamic latest-release fetch with hardcoded fallback) ──
+      # ── 4. iOS SDK ─────────────────────────────────────────────────────────
       - name: Install iOS SDK
         run: |
           mkdir -p "$THEOS/sdks"
 
-          # Try GitHub API first (gets newest SDK automatically)
-          ASSET_URL=$(curl -sfL \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/theos/sdks/releases/latest \
-            | python3 -c "
-          import sys, json
-          try:
-              data = json.load(sys.stdin)
-              urls = [a['browser_download_url']
-                      for a in data.get('assets', [])
-                      if a['name'].endswith('.sdk.tar.xz')]
-              print(urls[0] if urls else '')
-          except Exception:
-              print('')
-          ")
+          # Scrape the actual latest release tag from GitHub releases page
+          # (avoids GitHub API rate limits entirely — no token needed)
+          RELEASE_TAG=$(curl -sfL \
+            -H "User-Agent: Mozilla/5.0" \
+            "https://github.com/theos/sdks/releases" \
+            | grep -oE 'href="[^"]*iPhoneOS[0-9]+\.[0-9]+\.sdk\.tar\.xz"' \
+            | head -1 \
+            | grep -oE 'download/[^/]+' \
+            | sed 's|download/||')
 
-          # Hardcoded fallbacks if API fails or rate-limited
-          FALLBACKS=(
-            "https://github.com/theos/sdks/releases/download/iPhoneOS17.2/iPhoneOS17.2.sdk.tar.xz"
-            "https://github.com/theos/sdks/releases/download/iPhoneOS16.5/iPhoneOS16.5.sdk.tar.xz"
-            "https://github.com/theos/sdks/releases/download/iPhoneOS15.5/iPhoneOS15.5.sdk.tar.xz"
+          echo "Detected release tag: $RELEASE_TAG"
+
+          # Ordered preference: newest to oldest — all confirmed real filenames
+          SDKS=(
+            "iPhoneOS16.5"
+            "iPhoneOS15.6"
+            "iPhoneOS14.5"
+            "iPhoneOS13.7"
           )
 
-          download_and_extract() {
-            local url="$1"
-            echo "Trying: $url"
-            curl -fL --retry 3 --retry-delay 5 \
+          download_sdk() {
+            local TAG="$1"
+            local NAME="$2"
+            local URL="https://github.com/theos/sdks/releases/download/${TAG}/${NAME}.sdk.tar.xz"
+            echo "→ Trying: $URL"
+            curl -fL \
+              --retry 3 \
+              --retry-delay 5 \
               --connect-timeout 30 \
-              "$url" -o /tmp/sdk.tar.xz && \
-            tar xJf /tmp/sdk.tar.xz -C "$THEOS/sdks/" && \
-            rm /tmp/sdk.tar.xz && \
-            echo "SDK OK from $url" && return 0
-            return 1
+              --max-time 300 \
+              -H "User-Agent: Mozilla/5.0" \
+              "$URL" -o /tmp/sdk.tar.xz 2>&1 || return 1
+            echo "→ Extracting..."
+            tar xJf /tmp/sdk.tar.xz -C "$THEOS/sdks/" || return 1
+            rm -f /tmp/sdk.tar.xz
+            echo "✓ SDK installed: $NAME from tag $TAG"
+            return 0
           }
 
           SUCCESS=0
-          if [ -n "$ASSET_URL" ]; then
-            download_and_extract "$ASSET_URL" && SUCCESS=1
+
+          # Try scraped tag first (always up-to-date)
+          if [ -n "$RELEASE_TAG" ]; then
+            for SDK in "${SDKS[@]}"; do
+              download_sdk "$RELEASE_TAG" "$SDK" && SUCCESS=1 && break
+            done
           fi
 
+          # Hard fallback with confirmed working tag
           if [ "$SUCCESS" -eq 0 ]; then
-            for FB in "${FALLBACKS[@]}"; do
-              download_and_extract "$FB" && SUCCESS=1 && break
+            echo "Scrape failed — falling back to known tag: master-146e41f"
+            for SDK in "${SDKS[@]}"; do
+              download_sdk "master-146e41f" "$SDK" && SUCCESS=1 && break
             done
           fi
 
           if [ "$SUCCESS" -eq 0 ]; then
-            echo "FATAL: could not download any iOS SDK" >&2
+            echo "FATAL: all SDK download attempts failed" >&2
             exit 1
           fi
 
-          echo "Available SDKs:"
+          echo "── Available SDKs ──"
           ls "$THEOS/sdks/"
 
       # ── 5. Build ───────────────────────────────────────────────────────────
@@ -102,13 +111,13 @@ jobs:
             THEOS="$THEOS" \
             THEOS_PACKAGE_SCHEME=rootless
 
-      # ── 6. Verify output exists ────────────────────────────────────────────
+      # ── 6. Verify ──────────────────────────────────────────────────────────
       - name: Verify package
         run: |
           ls -lh packages/*.deb
-          echo "Build OK"
+          echo "✓ Build complete"
 
-      # ── 7. Upload artifact ─────────────────────────────────────────────────
+      # ── 7. Upload ──────────────────────────────────────────────────────────
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
